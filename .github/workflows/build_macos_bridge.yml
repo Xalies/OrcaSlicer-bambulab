@@ -221,12 +221,25 @@ jobs:
       - name: Create DMG without runtime validation
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/build/universal/OrcaSlicer_dmg"
           rm -rf "$GITHUB_WORKSPACE/build/universal/OrcaSlicer_dmg"/*
           cp -R "$GITHUB_WORKSPACE/build/universal/OrcaSlicer/OrcaSlicer.app" "$GITHUB_WORKSPACE/build/universal/OrcaSlicer_dmg/"
           ln -sfn /Applications "$GITHUB_WORKSPACE/build/universal/OrcaSlicer_dmg/Applications"
           ver=$(grep 'set(SoftFever_VERSION' version.inc | cut -d '"' -f2)
-          hdiutil create -volname "OrcaSlicer" -srcfolder "$GITHUB_WORKSPACE/build/universal/OrcaSlicer_dmg" -ov -format UDZO "OrcaSlicer_Mac_universal_V${ver}.dmg"
+          dmg_path="$GITHUB_WORKSPACE/OrcaSlicer_Mac_universal_V${ver}.dmg"
+          rm -f "$dmg_path"
+
+          cleanup_dmg_mounts() {
+            hdiutil detach "/Volumes/OrcaSlicer" -force >/dev/null 2>&1 || true
+          }
+
+          cleanup_dmg_mounts
+          if ! hdiutil create -volname "OrcaSlicer" -srcfolder "$GITHUB_WORKSPACE/build/universal/OrcaSlicer_dmg" -format UDZO "$dmg_path"; then
+            cleanup_dmg_mounts
+            sleep 5
+            hdiutil create -volname "OrcaSlicer" -srcfolder "$GITHUB_WORKSPACE/build/universal/OrcaSlicer_dmg" -format UDZO "$dmg_path"
+          fi
 
       - name: Explain skipped hosted runtime validation
         shell: bash
