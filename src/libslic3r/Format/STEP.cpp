@@ -6,6 +6,10 @@
 #include "STEP.hpp"
 
 #include <string>
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <iomanip>
 #include <boost/nowide/cstdio.hpp>
 #include <boost/nowide/iostream.hpp>
 #include <boost/nowide/fstream.hpp>
@@ -39,6 +43,169 @@
 
 
 namespace Slic3r {
+
+namespace {
+
+struct StepDebugFaceInfo
+{
+    size_t solid_index = 0;
+    int face_index = 0;
+    std::string solid_name;
+    std::string orientation;
+    int nodes = 0;
+    int triangles = 0;
+    int triangle_start = 0;
+    double min_x = 0.0;
+    double min_y = 0.0;
+    double min_z = 0.0;
+    double max_x = 0.0;
+    double max_y = 0.0;
+    double max_z = 0.0;
+};
+
+static std::string step_debug_export_dir()
+{
+    const char* value = std::getenv("ORCA_STEP_DEBUG_EXPORT");
+    return value == nullptr ? std::string{} : std::string(value);
+}
+
+static std::string step_debug_sanitize_filename(std::string value)
+{
+    for (char& ch : value) {
+        const unsigned char c = static_cast<unsigned char>(ch);
+        if (!std::isalnum(c) && ch != '-' && ch != '_')
+            ch = '_';
+    }
+    if (value.empty())
+        value = "solid";
+    return value;
+}
+
+static std::string step_debug_csv_escape(const std::string& value)
+{
+    if (value.find_first_of(",\"\r\n") == std::string::npos)
+        return value;
+    std::string escaped = "\"";
+    for (char ch : value) {
+        if (ch == '"')
+            escaped += "\"\"";
+        else
+            escaped += ch;
+    }
+    escaped += '"';
+    return escaped;
+}
+
+static std::string step_debug_orientation_name(TopAbs_Orientation orientation)
+{
+    switch (orientation) {
+    case TopAbs_FORWARD:  return "FORWARD";
+    case TopAbs_REVERSED: return "REVERSED";
+    case TopAbs_INTERNAL: return "INTERNAL";
+    case TopAbs_EXTERNAL: return "EXTERNAL";
+    default:              return "UNKNOWN";
+    }
+}
+
+static std::string step_debug_base_name(const std::string& path)
+{
+    const char* last_slash = strrchr(path.c_str(), DIR_SEPARATOR);
+    std::string filename = last_slash == nullptr ? path : last_slash + 1;
+    const size_t dot = filename.find_last_of('.');
+    if (dot != std::string::npos)
+        filename.resize(dot);
+    return step_debug_sanitize_filename(filename);
+}
+
+static void step_debug_write_obj(const boost::filesystem::path& path, const stl_file& mesh)
+{
+    boost::nowide::ofstream out(path.string());
+    if (!out.good())
+        return;
+
+    out << std::setprecision(9);
+    for (const stl_facet& facet : mesh.facet_start) {
+        for (int vertex = 0; vertex < 3; ++vertex) {
+            out << "v "
+                << facet.vertex[vertex](0) << ' '
+                << facet.vertex[vertex](1) << ' '
+                << facet.vertex[vertex](2) << '\n';
+        }
+    }
+
+    for (size_t face = 0; face < mesh.facet_start.size(); ++face) {
+        const size_t index = face * 3 + 1;
+        out << "f " << index << ' ' << index + 1 << ' ' << index + 2 << '\n';
+    }
+}
+
+static void step_debug_write_exports(
+    const std::string& export_dir,
+    const std::string& source_path,
+    const std::vector<NamedSolid>& named_solids,
+    const std::vector<stl_file>& meshes,
+    const std::vector<std::vector<StepDebugFaceInfo>>& face_infos,
+    double linear_deflection,
+    double angle_deflection)
+{
+    if (export_dir.empty())
+        return;
+
+    try {
+        boost::filesystem::path dir(export_dir);
+        boost::filesystem::create_directories(dir);
+        const std::string base_name = step_debug_base_name(source_path);
+
+        boost::nowide::ofstream summary((dir / (base_name + "_summary.csv")).string());
+        if (summary.good()) {
+            summary << "source,linear_deflection,angle_deflection,solid_index,solid_name,triangles,vertices,obj\n";
+            for (size_t i = 0; i < meshes.size(); ++i) {
+                if (meshes[i].stats.number_of_facets == 0)
+                    continue;
+                const std::string solid_name = i < named_solids.size() ? named_solids[i].name : std::string{};
+                const std::string obj_name = base_name + "_solid_" + std::to_string(i) + "_" + step_debug_sanitize_filename(solid_name) + ".obj";
+                summary << step_debug_csv_escape(source_path) << ','
+                        << linear_deflection << ','
+                        << angle_deflection << ','
+                        << i << ','
+                        << step_debug_csv_escape(solid_name) << ','
+                        << meshes[i].stats.number_of_facets << ','
+                        << meshes[i].stats.number_of_facets * 3 << ','
+                        << step_debug_csv_escape(obj_name) << '\n';
+                step_debug_write_obj(dir / obj_name, meshes[i]);
+            }
+        }
+
+        boost::nowide::ofstream faces((dir / (base_name + "_faces.csv")).string());
+        if (faces.good()) {
+            faces << "source,linear_deflection,angle_deflection,solid_index,solid_name,face_index,orientation,nodes,triangles,triangle_start,min_x,min_y,min_z,max_x,max_y,max_z\n";
+            for (const auto& solid_faces : face_infos) {
+                for (const StepDebugFaceInfo& face : solid_faces) {
+                    faces << step_debug_csv_escape(source_path) << ','
+                          << linear_deflection << ','
+                          << angle_deflection << ','
+                          << face.solid_index << ','
+                          << step_debug_csv_escape(face.solid_name) << ','
+                          << face.face_index << ','
+                          << face.orientation << ','
+                          << face.nodes << ','
+                          << face.triangles << ','
+                          << face.triangle_start << ','
+                          << face.min_x << ','
+                          << face.min_y << ','
+                          << face.min_z << ','
+                          << face.max_x << ','
+                          << face.max_y << ','
+                          << face.max_z << '\n';
+                }
+            }
+        }
+    } catch (...) {
+        // Debug export must never prevent STEP import.
+    }
+}
+
+} // namespace
 
 bool StepPreProcessor::preprocess(const char* path, std::string &output_path)
 {
@@ -542,6 +709,7 @@ Step::Step_Status Step::mesh(Model* model,
 
         std::vector<stl_file> stl;
         stl.resize(namedSolids.size());
+        std::vector<std::vector<StepDebugFaceInfo>> step_debug_faces(namedSolids.size());
         tbb::parallel_for(tbb::blocked_range<size_t>(0, namedSolids.size()), [&](const tbb::blocked_range<size_t>& range) {
             for (size_t i = range.begin(); i < range.end(); i++) {
                 BRepMesh_IncrementalMesh mesh(namedSolids[i].solid, linear_defletion, false, angle_defletion, true);
@@ -573,23 +741,62 @@ Step::Step_Status Step::mesh(Model* model,
                 // BBS: fill temporary triangulation
                 Standard_Integer aNodeOffset = 0;
                 Standard_Integer aTriangleOffet = 0;
+                Standard_Integer aFaceIndex = 0;
                 for (TopExp_Explorer anExpSF(namedSolids[i].solid, TopAbs_FACE); anExpSF.More(); anExpSF.Next()) {
+                    ++aFaceIndex;
                     const TopoDS_Shape& aFace = anExpSF.Current();
                     TopLoc_Location     aLoc;
+                    const TopAbs_Orientation anOrientation = aFace.Orientation();
                     Handle(Poly_Triangulation) aTriangulation = BRep_Tool::Triangulation(TopoDS::Face(aFace), aLoc);
                     if (aTriangulation.IsNull()) {
                         ++aNbFacesNoTri;
+                        step_debug_faces[i].push_back({
+                            i,
+                            aFaceIndex,
+                            namedSolids[i].name,
+                            step_debug_orientation_name(anOrientation),
+                            0,
+                            0,
+                            aTriangleOffet,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0
+                        });
                         continue;
                     }
+                    StepDebugFaceInfo face_debug;
+                    face_debug.solid_index = i;
+                    face_debug.face_index = aFaceIndex;
+                    face_debug.solid_name = namedSolids[i].name;
+                    face_debug.orientation = step_debug_orientation_name(anOrientation);
+                    face_debug.nodes = aTriangulation->NbNodes();
+                    face_debug.triangles = aTriangulation->NbTriangles();
+                    face_debug.triangle_start = aTriangleOffet;
+                    bool face_bounds_initialized = false;
                     // BBS: copy nodes
                     gp_Trsf aTrsf = aLoc.Transformation();
                     for (Standard_Integer aNodeIter = 1; aNodeIter <= aTriangulation->NbNodes(); ++aNodeIter) {
                         gp_Pnt aPnt = aTriangulation->Node(aNodeIter);
                         aPnt.Transform(aTrsf);
+                        if (!face_bounds_initialized) {
+                            face_debug.min_x = face_debug.max_x = aPnt.X();
+                            face_debug.min_y = face_debug.max_y = aPnt.Y();
+                            face_debug.min_z = face_debug.max_z = aPnt.Z();
+                            face_bounds_initialized = true;
+                        } else {
+                            face_debug.min_x = std::min(face_debug.min_x, aPnt.X());
+                            face_debug.min_y = std::min(face_debug.min_y, aPnt.Y());
+                            face_debug.min_z = std::min(face_debug.min_z, aPnt.Z());
+                            face_debug.max_x = std::max(face_debug.max_x, aPnt.X());
+                            face_debug.max_y = std::max(face_debug.max_y, aPnt.Y());
+                            face_debug.max_z = std::max(face_debug.max_z, aPnt.Z());
+                        }
                         points.emplace_back(std::move(Vec3f(aPnt.X(), aPnt.Y(), aPnt.Z())));
                     }
                     // BBS: copy triangles
-                    const TopAbs_Orientation anOrientation = anExpSF.Current().Orientation();
                     Standard_Integer anId[3] = {};
                     for (Standard_Integer aTriIter = 1; aTriIter <= aTriangulation->NbTriangles(); ++aTriIter) {
                         Poly_Triangle aTri = aTriangulation->Triangle(aTriIter);
@@ -611,6 +818,7 @@ Step::Step_Status Step::mesh(Model* model,
                         stl[i].facet_start[aTriangleOffet + aTriIter - 1] = facet;
                     }
 
+                    step_debug_faces[i].push_back(face_debug);
                     aNodeOffset += aTriangulation->NbNodes();
                     aTriangleOffet += aTriangulation->NbTriangles();
                 }
@@ -618,6 +826,14 @@ Step::Step_Status Step::mesh(Model* model,
             }
         });
 
+        step_debug_write_exports(
+            step_debug_export_dir(),
+            m_path,
+            namedSolids,
+            stl,
+            step_debug_faces,
+            linear_defletion,
+            angle_defletion);
 
         for (size_t i = 0; i < stl.size(); i++) {
             progress_2 = static_cast<float>(i) / stl.size();
